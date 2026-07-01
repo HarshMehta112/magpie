@@ -17,7 +17,7 @@
 
 """Validate framework skill definitions.
 
-This module validates ten aspects of every skill under
+This module validates twelve aspects of every skill under
 skills/:
 
 1. YAML frontmatter — every SKILL.md must have a valid frontmatter
@@ -60,6 +60,49 @@ skills/:
     satisfy without editing the skill.  Each hit is tagged with a
     remedy class (placeholder / adapter / capability-flag).  Never
     fails the run — advisory only.
+11. Adapter authoring smoke (SOFT) — every ``contract:*`` adapter
+    tool README must declare the three authoring fields that make an
+    adapter self-contained for adopters: credential / privacy
+    handling, supported operations, and adopter config keys.
+    Missing fields are advisories so legacy adapters can be brought
+    into compliance deliberately without blocking unrelated changes.
+12. docs/modes.md consistency (SOFT) — compares the per-mode skill
+    tables in ``docs/modes.md`` against live ``skills/*/SKILL.md``
+    frontmatter: every listed skill must exist on disk, each skill's
+    ``mode:`` frontmatter must match the section it appears in, the
+    claimed skill counts in the "Modes at a glance" table must equal
+    the actual per-section row counts, and every live skill with a
+    ``mode:`` frontmatter must appear in the corresponding section.
+    Advisory only — never fails the run unless ``--strict``.
+13. Status field validation (HARD) — when a skill declares a
+    ``status:`` frontmatter key, its value must be from the
+    documented lifecycle vocabulary (``ALLOWED_SKILL_STATUSES``).
+    An unknown status (e.g. ``proposed``, ``done``) is a HARD failure
+    because those values belong to the spec lifecycle, not skill
+    lifecycle.
+14. Multi-capability form advisory (SOFT) — when a ``capability:``
+    value looks like multiple tokens joined by a space or comma (e.g.
+    ``capability: capability:fix capability:resolve``), the skill is
+    using string form for what should be a YAML list.  Use the list
+    form (``capability:\\n  - capability:fix\\n  - capability:resolve``)
+    so each entry is validated individually.  Advisory only — the
+    vocabulary check (aspect 1) already rejects the joined string, but
+    this advisory gives a more actionable error message.
+15. Override-file contract (SOFT) — when a ``.apache-magpie-overrides/``
+    directory exists in the repo, every ``<skill>.md`` file inside it is
+    checked to ensure it carries the canonical ``apache-magpie agentic
+    override`` header comment and does not contain heuristic patterns that
+    attempt to weaken the framework's safety / confidentiality / privacy /
+    external-content-as-data baseline.  Advisory only — prose explanations
+    of what NOT to do can false-positive here.
+16. Project-template drift (SOFT) — compares ``projects/_template/``
+    with ``projects/non-asf-example/`` for structural drift: files
+    referenced in the example README must exist on disk, every config
+    file in the example must be documented in its README, and config
+    files present in both profiles must have the same h2 section
+    headings (``project.md`` and ``README.md`` are excluded from the
+    h2 comparison because their structures intentionally differ by
+    organization profile). Advisory only.
 
 SOFT categories surface as advisory warnings (stderr) without
 failing the run unless ``--strict`` is passed.
@@ -73,6 +116,7 @@ Run from repo root:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import re
 import sys
 from collections.abc import Iterable
@@ -87,12 +131,16 @@ TOOLS_DIR = Path("tools")
 DOCS_DIR = Path("docs")
 SKILL_EVALS_DIR = Path("tools/skill-evals/evals")
 PROJECTS_TEMPLATE_DIR = Path("projects/_template")
+PROJECTS_NON_ASF_EXAMPLE_DIR = Path("projects/non-asf-example")
+MODES_DOC_PATH = Path("docs/modes.md")
+OVERRIDES_DIR = Path(".apache-magpie-overrides")
 
 # Categories for the tool-validator block. All HARD by default — every
 # tool must have a README that declares its capability and its prerequisites.
 TOOL_README_CATEGORY = "tool-readme"
 TOOL_CAPABILITY_CATEGORY = "tool-capability"
 TOOL_PREREQUISITES_CATEGORY = "tool-prerequisites"
+TOOL_PREREQUISITES_FIELDS_CATEGORY = "tool-prerequisites-fields"
 
 # Matches the `**Capability:** <token>` line (tool capability =
 # `contract:NAME` / `substrate:NAME`, multi-value `a + b`) regardless of
@@ -103,6 +151,64 @@ TOOL_CAPABILITY_RE = re.compile(r"^\*\*Capability:\*\*[ \t]+(.+)$", re.MULTILINE
 # one so the tool's runtime / CLI / credential / network requirements are
 # stated up front rather than discovered at first run.
 TOOL_PREREQUISITES_RE = re.compile(r"^##[ \t]+Prerequisites[ \t]*$", re.MULTILINE)
+
+# ---------------------------------------------------------------------------
+# Adapter authoring contract patterns (aspect #11, SOFT advisory)
+# ---------------------------------------------------------------------------
+
+# Capability prefix that identifies an adapter (as opposed to a substrate tool).
+_ADAPTER_CONTRACT_PREFIX = "contract:"
+
+# Credential / privacy handling — matches the canonical **Credentials / auth:**
+# bullet used in most adapter Prerequisites sections, plus equivalent bolded
+# labels that declare credential handling under different wording (e.g. a
+# contract README that delegates to a backend with
+# **CLIs / credentials / network:**). The shape is a bolded label ending in a
+# colon that mentions "credential(s)" — narrow enough to avoid matching prose.
+_ADAPTER_CREDENTIALS_RE = re.compile(r"\*\*[^*]*\bcredentials?\b[^*]*:\*\*", re.IGNORECASE)
+
+# Operations documentation — any of: a named operations section heading, a
+# tool.md or operations.md reference in the intro text.
+_ADAPTER_OPERATIONS_RE = re.compile(
+    r"(?:"
+    r"^##\s+(?:Operations|Interface|How\s+to\s+use|Invocation"
+    r"|Read\s+subcommands|Write\s+subcommands|Subcommands)\s*$"
+    r"|\btool\.md\b"
+    r"|\boperations\.md\b"
+    r")",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Config keys documentation — a Configuration section, a project-config
+# / *-config.md reference, or an inline dotted project-config key
+# (`tools.<adapter>.<key>`) that points adopters to the adopter-visible knobs.
+_ADAPTER_CONFIG_RE = re.compile(
+    r"(?:"
+    r"^##\s+(?:Configuration|Config(?:uration)?\s+[Kk]eys?)\s*$"
+    r"|\bproject-config\b"
+    r"|-config\.md\b"
+    r"|\btools\.[a-z0-9_-]+\.[a-z0-9_]+\b"
+    r")",
+    re.MULTILINE,
+)
+
+# Sub-field regexes for the standard four-line Prerequisites layout:
+#   **Runtime:** ...
+#   **CLIs:** ...         (or **CLIs / credentials / network:** for delegation)
+#   **Credentials / auth:** ...
+#   **Network:** ...
+# Labels follow the `**LABEL:** value` convention (colon inside the closing
+# bold markers, e.g. `**Runtime:**`).  Each pattern matches either that style
+# OR the less-common `**LABEL**:` style (colon outside) to stay robust.
+# The delegation pattern (`**CLIs / credentials / network:**`) is the accepted
+# short form for pure-contract tools that delegate all three to an adapter.
+_PREREQ_RUNTIME_RE = re.compile(r"\*\*Runtime:?\*\*\s*:?", re.MULTILINE)
+_PREREQ_CLIS_RE = re.compile(r"\*\*CLIs?:?\*\*\s*:?", re.MULTILINE)
+_PREREQ_CREDENTIALS_RE = re.compile(r"\*\*Credentials?(?:\s*/\s*auth)?:?\*\*\s*:?", re.MULTILINE)
+_PREREQ_NETWORK_RE = re.compile(r"\*\*Network:?\*\*\s*:?", re.MULTILINE)
+_PREREQ_DELEGATION_RE = re.compile(
+    r"\*\*CLIs\s*/\s*credentials\s*/\s*network:?\*\*\s*:?", re.MULTILINE | re.IGNORECASE
+)
 
 # Optional `**Organization:** <org>` line in a tool README — declares that
 # the tool belongs to / is the adapter for a specific organization (e.g.
@@ -135,8 +241,14 @@ _CAPABILITY_TOKEN_RE = re.compile(r"`?((?:capability|contract|substrate):[a-z-]+
 _ITALIC_PARENS_RE = re.compile(r"\*\(.*?\)\*")
 
 REQUIRED_FRONTMATTER_KEYS = {"name", "description", "license", "capability"}
-OPTIONAL_FRONTMATTER_KEYS = {"when_to_use", "mode", "organization"}
+OPTIONAL_FRONTMATTER_KEYS = {"when_to_use", "mode", "organization", "status", "source"}
 ALLOWED_LICENSES = {"Apache-2.0"}
+
+# Documented skill lifecycle vocabulary.  Skills may declare a ``status:``
+# frontmatter key; its value must be one of these strings.  Spec lifecycle
+# values (``proposed``, ``done``) belong only in spec-loop spec files and
+# are rejected here so a spec status cannot accidentally appear on a skill.
+ALLOWED_SKILL_STATUSES: frozenset[str] = frozenset({"experimental"})
 
 # Canonical capability taxonomy — two orthogonal axes per RFC-AI-0005;
 # docs/labels-and-capabilities.md is authoritative.
@@ -299,6 +411,10 @@ TRIGGER_PRESERVATION_CATEGORY = "trigger_preservation"
 # Pattern 4 — injection-guard callout.  Missing callout = HARD; unfilled TODO = SOFT.
 INJECTION_GUARD_CATEGORY = "injection_guard"
 INJECTION_GUARD_TODO_CATEGORY = "injection_guard_todo"
+# Skill lifecycle status vocabulary check (HARD).
+STATUS_CATEGORY = "skill_status"
+# Space/comma-separated multi-capability form check (SOFT advisory).
+MULTI_CAPABILITY_CATEGORY = "multi_capability_form"
 
 GH_LIST_CATEGORY = "gh_list_no_limit"
 SECURITY_PATTERN_CATEGORY = "security_pattern"
@@ -314,6 +430,17 @@ LICENSE_HEADER_CATEGORY = "license_header"
 # editing the skill body.  Each hit is tagged with a remedy class so maintainers
 # know how to generalise it.  Never fails the run.
 ASF_COUPLING_CATEGORY = "asf_coupling"
+# SOFT advisory: adapter authoring fields for contract:* tools.
+ADAPTER_AUTHORING_CATEGORY = "adapter-authoring"
+# SOFT advisory: docs/modes.md skill lists and claimed counts are checked against
+# live skill frontmatter — detects doc drift before review.
+MODES_DOC_CATEGORY = "modes-doc-consistency"
+# SOFT advisory: override files in .apache-magpie-overrides/ must not weaken the
+# framework's safety / confidentiality / privacy / data-not-instructions baseline.
+OVERRIDE_CONTRACT_CATEGORY = "override-contract"
+# SOFT advisory: structural drift between projects/_template/ and
+# projects/non-asf-example/ — missing files, undocumented files, or h2 mismatches.
+TEMPLATE_DRIFT_CATEGORY = "template-drift"
 
 # The `magpie-` namespace prefix every installed framework skill carries.
 SKILL_NAME_PREFIX = "magpie-"
@@ -328,6 +455,11 @@ SOFT_CATEGORIES: frozenset[str] = frozenset(
         LOWERCASE_F_FIELD_CATEGORY,
         EVAL_COVERAGE_CATEGORY,
         ASF_COUPLING_CATEGORY,
+        ADAPTER_AUTHORING_CATEGORY,
+        MODES_DOC_CATEGORY,
+        MULTI_CAPABILITY_CATEGORY,
+        OVERRIDE_CONTRACT_CATEGORY,
+        TEMPLATE_DRIFT_CATEGORY,
     }
 )
 HARD_CATEGORIES: frozenset[str] = frozenset(
@@ -335,11 +467,13 @@ HARD_CATEGORIES: frozenset[str] = frozenset(
         TOOL_README_CATEGORY,
         TOOL_CAPABILITY_CATEGORY,
         TOOL_PREREQUISITES_CATEGORY,
+        TOOL_PREREQUISITES_FIELDS_CATEGORY,
         ORGANIZATION_CATEGORY,
         CAPABILITY_SYNC_CATEGORY,
         INJECTION_GUARD_CATEGORY,
         NAME_CONVENTION_CATEGORY,
         LICENSE_HEADER_CATEGORY,
+        STATUS_CATEGORY,
     }
 )
 ALL_CATEGORIES = HARD_CATEGORIES | SOFT_CATEGORIES
@@ -623,8 +757,28 @@ def validate_frontmatter(path: Path, text: str, root: Path | None = None) -> Ite
         #   single — `capability: capability:triage`            → "capability:triage"
         #   list   — `capability:\n  - capability:intake\n …`   → "- capability:intake\n- capability:platform"
         # Split on lines, strip `- ` prefix when present.
+        raw_cap = fm["capability"]
+
+        # Advisory: detect space- or comma-separated multi-capability written as a
+        # string instead of a YAML list.  The vocabulary check below would also catch
+        # it (the joined string is not in SKILL_CAPABILITIES), but this gives a more
+        # actionable message so the author knows exactly how to fix the form.
+        if not raw_cap.startswith("- "):
+            # Two capability:* tokens joined by a space or comma look like string-form
+            # multi-capability.  One token (the normal single-value form) is fine.
+            _multi_cap_re = re.compile(r"capability:[a-z-]+[ ,]+capability:[a-z-]+")
+            if _multi_cap_re.search(raw_cap):
+                yield Violation(
+                    path,
+                    1,
+                    f"multi-capability declared as a string '{raw_cap}' — "
+                    f"use YAML list form (capability:\\n  - capability:foo\\n  - capability:bar) "
+                    f"so each entry is validated individually",
+                    category=MULTI_CAPABILITY_CATEGORY,
+                )
+
         entries: list[str] = []
-        for raw_line in fm["capability"].splitlines():
+        for raw_line in raw_cap.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
@@ -642,6 +796,16 @@ def validate_frontmatter(path: Path, text: str, root: Path | None = None) -> Ite
                     f"frontmatter capability '{entry}' not in {sorted(SKILL_CAPABILITIES)} "
                     f"(skills use Axis-1 capability:* values; see docs/labels-and-capabilities.md)",
                 )
+
+    if fm.get("status") and fm["status"] not in ALLOWED_SKILL_STATUSES:
+        yield Violation(
+            path,
+            1,
+            f"frontmatter status '{fm['status']}' not in {sorted(ALLOWED_SKILL_STATUSES)} "
+            f"(documented skill lifecycle vocabulary; spec values like 'proposed'/'done' "
+            f"belong in spec-loop specs, not in skill frontmatter)",
+            category=STATUS_CATEGORY,
+        )
 
     desc_len = len(fm.get("description", ""))
     wtu_len = len(fm.get("when_to_use", ""))
@@ -1408,7 +1572,8 @@ def validate_tools(root: Path | None = None) -> Iterable[Violation]:
             yield Violation(readme, None, f"cannot read README.md: {exc}")
             continue
 
-        if TOOL_PREREQUISITES_RE.search(text) is None:
+        prereq_match = TOOL_PREREQUISITES_RE.search(text)
+        if prereq_match is None:
             yield Violation(
                 readme,
                 1,
@@ -1417,6 +1582,38 @@ def validate_tools(root: Path | None = None) -> Iterable[Violation]:
                 f"access up front (see tools/AGENTS.md)",
                 category=TOOL_PREREQUISITES_CATEGORY,
             )
+        else:
+            # Validate sub-field structure within the Prerequisites section.
+            # Each section must declare **Runtime:**, **CLIs:**, **Credentials /
+            # auth:**, and **Network:** as bold bullet labels, OR use the
+            # accepted delegation shorthand **CLIs / credentials / network:**
+            # (for pure-contract tools that proxy all three to a concrete adapter).
+            next_heading = re.search(r"^##\s+", text[prereq_match.end() :], re.MULTILINE)
+            section_end = prereq_match.end() + next_heading.start() if next_heading else len(text)
+            section = text[prereq_match.start() : section_end]
+            has_delegation = bool(_PREREQ_DELEGATION_RE.search(section))
+            missing: list[str] = []
+            if not _PREREQ_RUNTIME_RE.search(section):
+                missing.append("**Runtime:**")
+            if not has_delegation:
+                if not _PREREQ_CLIS_RE.search(section):
+                    missing.append("**CLIs:**")
+                if not _PREREQ_CREDENTIALS_RE.search(section):
+                    missing.append("**Credentials / auth:**")
+                if not _PREREQ_NETWORK_RE.search(section):
+                    missing.append("**Network:**")
+            if missing:
+                yield Violation(
+                    readme,
+                    text[: prereq_match.start()].count("\n") + 1,
+                    f"tool '{tool_dir.name}' Prerequisites section missing required "
+                    f"sub-field(s): {', '.join(missing)} — use bold labels "
+                    f"(**Runtime:**, **CLIs:**, **Credentials / auth:**, **Network:**) "
+                    f"or the delegation shorthand "
+                    f"(**CLIs / credentials / network:** Provided by …) "
+                    f"for pure-contract tools",
+                    category=TOOL_PREREQUISITES_FIELDS_CATEGORY,
+                )
 
         org_match = TOOL_ORGANIZATION_RE.search(text)
         if org_match is not None:
@@ -1464,6 +1661,86 @@ def validate_tools(root: Path | None = None) -> Iterable[Violation]:
                     f"values; see docs/labels-and-capabilities.md)",
                     category=TOOL_CAPABILITY_CATEGORY,
                 )
+
+
+def validate_adapter_authoring(root: Path | None = None) -> Iterable[Violation]:
+    """Advisory (SOFT) checks for ``contract:*`` adapter tool READMEs.
+
+    Adapter READMEs are the primary documentation surface for adopters
+    choosing and configuring an adapter.  Three authoring fields make
+    an adapter self-contained:
+
+    1. **Credential / privacy handling** — ``**Credentials / auth:**``
+       in the README so adopters know what credentials the adapter needs
+       and what privacy boundaries it respects.
+    2. **Operations documentation** — at least one of: an ``## Operations``
+       / ``## Interface`` / ``## Invocation`` / ``## How to use`` section,
+       or a ``tool.md`` / ``operations.md`` reference so adopters can
+       discover what the adapter actually does.
+    3. **Config keys** — a ``## Configuration`` section or a
+       ``project-config`` / ``*-config.md`` reference so adopters know
+       which knobs they control.
+
+    All are SOFT advisories — legacy adapters can be brought into
+    compliance deliberately without blocking unrelated changes.
+    ``substrate:*`` tools are excluded; the contract applies only to
+    ``contract:*`` adapter tools.
+    """
+    for tool_dir in collect_tool_dirs(root):
+        readme = tool_dir / "README.md"
+        if not readme.exists():
+            continue  # validate_tools already reported the missing README
+        try:
+            text = readme.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        # Only check contract:* adapter tools
+        cap_match = TOOL_CAPABILITY_RE.search(text)
+        if cap_match is None:
+            continue
+        raw_cap = cap_match.group(1).strip()
+        entries = [e.strip() for e in raw_cap.split("+") if e.strip()]
+        if not any(e.startswith(_ADAPTER_CONTRACT_PREFIX) for e in entries):
+            continue
+
+        # Check 1: credential / privacy handling
+        if _ADAPTER_CREDENTIALS_RE.search(text) is None:
+            yield Violation(
+                readme,
+                1,
+                f"adapter-authoring [credential-handling] adapter '{tool_dir.name}' "
+                f"README missing '**Credentials / auth:**' — adapter READMEs must "
+                f"declare credential and privacy handling requirements so adopters "
+                f"know what the adapter needs before wiring it in "
+                f"(see docs/adapters.md § Adapter READMEs are contracts)",
+                category=ADAPTER_AUTHORING_CATEGORY,
+            )
+
+        # Check 2: operations documentation
+        if _ADAPTER_OPERATIONS_RE.search(text) is None:
+            yield Violation(
+                readme,
+                1,
+                f"adapter-authoring [operations] adapter '{tool_dir.name}' "
+                f"README has no operations section (## Operations / ## Interface / "
+                f"## Invocation / ## How to use) or tool.md reference — "
+                f"document supported operations so adopters know what the adapter provides "
+                f"(see docs/adapters.md § Adapter READMEs are contracts)",
+                category=ADAPTER_AUTHORING_CATEGORY,
+            )
+
+        # Check 3: config keys documentation
+        if _ADAPTER_CONFIG_RE.search(text) is None:
+            yield Violation(
+                readme,
+                1,
+                f"adapter-authoring [config-keys] adapter '{tool_dir.name}' "
+                f"README has no ## Configuration section or project-config reference — "
+                f"document adopter config keys so the adapter is self-contained "
+                f"(see docs/adapters.md § Adapter READMEs are contracts)",
+                category=ADAPTER_AUTHORING_CATEGORY,
+            )
 
 
 def _parse_capability_doc_table(text: str, header: str) -> dict[str, set[str]]:
@@ -1878,6 +2155,20 @@ _ASF_COUPLING_ALLOW_MARKERS: tuple[str, ...] = (
     "asf-default",
 )
 
+# Markers that make *low-confidence* governance mentions intentional on a line
+# but must NOT silence high-confidence operational patterns (svn commands,
+# hardcoded apache.org lists, dist-tree paths) that may appear on the same line.
+# Unlike _ASF_COUPLING_ALLOW_MARKERS these never short-circuit the whole line —
+# they only gate the low-confidence tier, mirroring the organization:ASF opt-out.
+_ASF_COUPLING_LOW_CONF_ALLOW_MARKERS: tuple[str, ...] = (
+    # "ASF PMC" explicitly qualifies the org context, so the bare PMC mention
+    # is intentional — but a real `svn` command on the same line must still fire.
+    "ASF PMC",
+    # Lines discussing prompt-injection examples: PMC/ICLA appear as examples of
+    # attacker-crafted social-engineering text, not as actual skill process steps.
+    "prompt-injection",
+)
+
 
 def validate_asf_coupling(path: Path, text: str) -> Iterable[Violation]:
     """Flag ASF-coupled tokens in skill bodies as advisory hints.
@@ -1890,9 +2181,29 @@ def validate_asf_coupling(path: Path, text: str) -> Iterable[Violation]:
     Reuses the existing ALLOWLIST_PATHS and INLINE_ALLOW_MARKERS machinery
     from validate_placeholders.  Additional _ASF_COUPLING_ALLOW_MARKERS
     cover lines that already name the generalisation mechanism.
+
+    Skills that declare ``organization: ASF`` in their frontmatter are
+    explicitly scoped to ASF and may legitimately use low-confidence
+    governance terms (PMC, ICLA, incubator) without generalisation.
+    Low-confidence hits are suppressed for those skills; high-confidence
+    patterns (svn commands, hardcoded apache.org lists, dist tree paths,
+    Vulnogram URL) still fire because they should be behind capability flags
+    even in ASF-only skills.
+
+    The organization:ASF opt-out is intentional and silent by design: the
+    suppression exists precisely to keep legitimately ASF-scoped skills (the
+    release and contributor families) from emitting noise on terms they are
+    supposed to use. The opt-out is not a hidden escape hatch — it is gated on
+    the explicit, validated ``organization:`` frontmatter key, which is itself
+    visible in every skill and cross-checked against ``organizations/``. The
+    suppression only ever silences the *advisory* low-confidence tier;
+    high-confidence patterns are never suppressed by it.
     """
     if is_path_allowlisted(path):
         return
+
+    fm = parse_frontmatter(text)
+    skip_low = fm is not None and fm.get("organization", "").strip() == "ASF"
 
     lines = text.splitlines()
     for line_no, line in enumerate(lines, start=1):
@@ -1900,18 +2211,27 @@ def validate_asf_coupling(path: Path, text: str) -> Iterable[Violation]:
         # intentional explanatory mentions.
         if line_has_inline_allow_marker(line):
             continue
-        # ASF-coupling-specific markers: line already names the guard mechanism.
+        # ASF-coupling-specific markers: line already names the guard mechanism,
+        # so the coupling is generalised — skip the whole line.
         if any(marker in line for marker in _ASF_COUPLING_ALLOW_MARKERS):
             continue
+        # Low-confidence-only suppression: the organization:ASF opt-out or a
+        # descriptive marker ("ASF PMC", a prompt-injection example) makes soft
+        # governance mentions intentional, but high-confidence operational
+        # patterns on the same line must still fire.
+        line_skips_low = skip_low or any(marker in line for marker in _ASF_COUPLING_LOW_CONF_ALLOW_MARKERS)
         for pattern, confidence, remedy, note in _ASF_COUPLING_PATTERNS:
             m = pattern.search(line)
-            if m:
-                yield Violation(
-                    path,
-                    line_no,
-                    f"asf-coupling [{confidence}] remedy:{remedy} — {note} (matched: {m.group()!r})",
-                    category=ASF_COUPLING_CATEGORY,
-                )
+            if not m:
+                continue
+            if confidence == "low" and line_skips_low:
+                continue
+            yield Violation(
+                path,
+                line_no,
+                f"asf-coupling [{confidence}] remedy:{remedy} — {note} (matched: {m.group()!r})",
+                category=ASF_COUPLING_CATEGORY,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1965,6 +2285,335 @@ def collect_doc_files(root: Path | None = None) -> set[Path]:
 
 
 # ---------------------------------------------------------------------------
+# docs/modes.md consistency check (check #11, SOFT)
+# ---------------------------------------------------------------------------
+
+# Regex that matches a skill row in a per-mode section table:
+#   | [`skill-slug`](../skills/skill-slug/SKILL.md) | ... |
+# Group 1: skill slug (the backtick-quoted identifier).
+_MODES_DOC_SKILL_ROW_RE = re.compile(r"^\|\s*\[`([a-z][a-z0-9-]*)`\]\(\.\./skills/[^)]+/SKILL\.md\)")
+
+# Regex that matches the skill-count cell in the "Modes at a glance" table:
+#   | **ModeName** | purpose text | status text | 30 |
+# Group 1: mode name (the bold identifier).
+# Group 2: skill count (last non-empty cell, integer).
+_MODES_GLANCE_ROW_RE = re.compile(r"^\|\s*\*\*([^*]+)\*\*\s*\|[^|]+\|[^|]+\|\s*(\d+)\s*\|")
+
+# The h2 headings in docs/modes.md that map 1-to-1 to mode names in skill
+# frontmatter.  "Outside the modes" and "Agentic Autonomous" are listed
+# separately because they don't correspond to mode: frontmatter values.
+_MODES_DOC_NAMED_SECTIONS: frozenset[str] = frozenset({"Triage", "Mentoring", "Drafting", "Pairing"})
+_MODES_DOC_SKIP_SECTIONS: frozenset[str] = frozenset({"Agentic Autonomous", "Outside the modes"})
+
+
+def _parse_modes_doc(
+    text: str,
+) -> tuple[dict[str, int], dict[str, list[str]], list[str]]:
+    """Parse docs/modes.md into (claimed_counts, section_skills, outside_skills).
+
+    claimed_counts  — {mode_name: claimed_int} from "Modes at a glance" table.
+    section_skills  — {mode_name: [slug, …]} from each named h2 section.
+    outside_skills  — [slug, …] listed under "## Outside the modes".
+    """
+    claimed_counts: dict[str, int] = {}
+    section_skills: dict[str, list[str]] = {}
+    outside_skills: list[str] = []
+
+    # --- "Modes at a glance" table ---
+    if "## Modes at a glance" in text:
+        glance_section = text.split("## Modes at a glance", 1)[1]
+        next_h2 = glance_section.find("\n## ")
+        if next_h2 > 0:
+            glance_section = glance_section[:next_h2]
+        for line in glance_section.splitlines():
+            m = _MODES_GLANCE_ROW_RE.match(line)
+            if m:
+                mode_name = m.group(1).strip()
+                with contextlib.suppress(ValueError):
+                    claimed_counts[mode_name] = int(m.group(2))
+
+    # --- Per-section skill rows ---
+    current_section: str | None = None
+    for line in text.splitlines():
+        h2_match = re.match(r"^## (.+)$", line)
+        if h2_match:
+            current_section = h2_match.group(1).strip()
+            continue
+        if current_section is None:
+            continue
+        row_match = _MODES_DOC_SKILL_ROW_RE.match(line)
+        if not row_match:
+            continue
+        slug = row_match.group(1)
+        if current_section == "Outside the modes":
+            outside_skills.append(slug)
+        elif current_section in _MODES_DOC_NAMED_SECTIONS:
+            section_skills.setdefault(current_section, []).append(slug)
+
+    return claimed_counts, section_skills, outside_skills
+
+
+def validate_modes_doc_consistency(root: Path | None = None) -> Iterable[Violation]:
+    """Compare docs/modes.md skill tables against live skill frontmatter.
+
+    Four advisory checks (all SOFT — never fails the run unless --strict):
+
+    1. **Missing skill** — a slug listed in a named per-mode section
+       (Triage / Mentoring / Drafting / Pairing) has no matching
+       ``skills/<slug>/`` directory on disk.
+
+    2. **Mode mismatch** — a skill listed in section ``X`` has a ``mode:``
+       frontmatter value that differs from ``X``.  Skills without a
+       ``mode:`` frontmatter field are exempt (not every skill declares one).
+
+    3. **Count mismatch** — the integer in the Skill-count column of the
+       "Modes at a glance" table does not match the number of skill rows
+       actually present in that section.  Counts for "Agentic Autonomous"
+       and "Outside the modes" are skipped (no skill rows expected there).
+
+    4. **Unlisted skill** — a live skill under ``skills/`` has a ``mode:``
+       frontmatter value that is a named section (Triage / Mentoring /
+       Drafting / Pairing) but the skill does not appear in that section.
+       This catches new skills that were added to the skill directory without
+       updating docs/modes.md.
+    """
+    repo_root = root or find_repo_root()
+    doc_path = repo_root / MODES_DOC_PATH
+    if not doc_path.exists():
+        return
+
+    try:
+        doc_text = doc_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    claimed_counts, section_skills, _outside_skills = _parse_modes_doc(doc_text)
+
+    # Build the set of skills listed per section for O(1) membership tests.
+    section_skill_sets: dict[str, set[str]] = {mode: set(slugs) for mode, slugs in section_skills.items()}
+
+    # Check 1 & 2 — per-listed-skill checks.
+    for mode, slugs in section_skills.items():
+        for slug in slugs:
+            skill_dir = repo_root / SKILLS_DIR / slug
+            if not skill_dir.is_dir():
+                yield Violation(
+                    doc_path,
+                    None,
+                    f"modes-doc: skill '{slug}' listed in '## {mode}' section "
+                    f"but skills/{slug}/ does not exist — remove the row or add the skill",
+                    category=MODES_DOC_CATEGORY,
+                )
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            try:
+                skill_text = skill_md.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fm = parse_frontmatter(skill_text)
+            if fm is None:
+                continue
+            fm_mode = fm.get("mode", "")
+            if fm_mode and fm_mode != mode:
+                yield Violation(
+                    doc_path,
+                    None,
+                    f"modes-doc: skill '{slug}' is listed under '## {mode}' "
+                    f"but its frontmatter declares mode: {fm_mode!r} — "
+                    f"move the row to '## {fm_mode}' or fix the frontmatter",
+                    category=MODES_DOC_CATEGORY,
+                )
+
+    # Check 3 — claimed count vs actual row count.
+    for mode, claimed in claimed_counts.items():
+        if mode in _MODES_DOC_SKIP_SECTIONS:
+            continue
+        if mode not in _MODES_DOC_NAMED_SECTIONS:
+            continue
+        actual = len(section_skills.get(mode, []))
+        if actual != claimed:
+            yield Violation(
+                doc_path,
+                None,
+                f"modes-doc: '## Modes at a glance' claims {claimed} skill(s) for "
+                f"'{mode}' but the '## {mode}' section lists {actual} skill row(s) — "
+                f"update the Skill count column",
+                category=MODES_DOC_CATEGORY,
+            )
+
+    # Check 4 — live skills with mode: not listed in the corresponding section.
+    skills_base = repo_root / SKILLS_DIR
+    if not skills_base.exists():
+        return
+    for skill_dir in sorted(skills_base.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            skill_text = skill_md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm = parse_frontmatter(skill_text)
+        if fm is None:
+            continue
+        fm_mode = fm.get("mode", "")
+        if fm_mode not in _MODES_DOC_NAMED_SECTIONS:
+            continue
+        slug = skill_dir.name
+        if slug not in section_skill_sets.get(fm_mode, set()):
+            yield Violation(
+                doc_path,
+                None,
+                f"modes-doc: skill '{slug}' has frontmatter mode: {fm_mode!r} "
+                f"but is not listed in the '## {fm_mode}' section of docs/modes.md — "
+                f"add a row for this skill",
+                category=MODES_DOC_CATEGORY,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Override-file contract check (SOFT advisory)
+# ---------------------------------------------------------------------------
+
+# The canonical header marker that every scaffolded override file carries.
+# Its presence confirms the file was created via the `/magpie-setup override`
+# flow and is recognised by framework skills as an override file.
+_OVERRIDE_HEADER_MARKER = "apache-magpie agentic override"
+
+# Patterns that indicate an override is attempting to weaken the framework's
+# safety / confidentiality / privacy / data-not-instructions baseline.
+# Each entry is (compiled regex, short description for the violation message).
+# All are heuristic — false positives are possible in explanatory prose, so
+# the check is SOFT and advisory only.
+_OVERRIDE_WEAKENING_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Attempting to ignore, skip, bypass, or disable safety/security controls
+    (
+        re.compile(
+            r"\b(?:ignore|skip|bypass|disable|remove|drop|override)\b"
+            r"[^.!?\n]{0,60}"
+            r"\b(?:safety|security|confidential(?:ity)?|privacy"
+            r"|injection[- ]guard|llm[- ]gate|baseline|hard[- ]rule|golden[- ]rule)\b",
+            re.IGNORECASE,
+        ),
+        "override-weakening: may attempt to weaken a framework safety/confidentiality/privacy baseline rule",
+    ),
+    # Contradicting the external-content-as-data rule
+    (
+        re.compile(
+            r"\btreat\b[^.!?\n]{0,50}"
+            r"\b(?:external\s+content|external\s+input|email\s+body|PR\s+comment|issue\s+body)\b"
+            r"[^.!?\n]{0,30}\b(?:instruction|command|directive|trusted)\b",
+            re.IGNORECASE,
+        ),
+        "override-weakening: may contradict the external-content-is-data rule (not an instruction)",
+    ),
+    # Attempting to share / disclose / leak confidential information
+    (
+        re.compile(
+            r"\b(?:share|disclose|reveal|expose|leak|forward)\b"
+            r"[^.!?\n]{0,40}"
+            r"\b(?:confidential|private|secret|security\s+report|vulnerability|embargo|tracker\s+body)\b",
+            re.IGNORECASE,
+        ),
+        "override-weakening: may attempt to share confidential or embargoed information",
+    ),
+    # Explicitly targeting the injection guard or privacy gate for removal
+    (
+        re.compile(
+            r"\b(?:skip|remove|bypass|disable|ignore)\b"
+            r"[^.!?\n]{0,60}"
+            r"\b(?:privacy[- ]llm[- ](?:check|gate)|privacy[- ]gate|llm[- ]check"
+            r"|injection[- ]guard|external[- ]content[- ]check)\b",
+            re.IGNORECASE,
+        ),
+        "override-weakening: may attempt to skip the Privacy-LLM gate or injection-guard callout",
+    ),
+]
+
+
+def validate_override_file(path: Path, text: str) -> Iterable[Violation]:
+    """Advisory checks for a single ``.apache-magpie-overrides/<skill>.md`` file.
+
+    Two checks:
+
+    1. **Structure** (SOFT) — the file should carry the ``apache-magpie
+       agentic override`` comment header that ``/magpie-setup override``
+       scaffolds.  A missing header is advisory (the file may have been
+       hand-written) but signals that the file may not be recognised by
+       framework skills that look for the canonical header.
+
+    2. **Baseline integrity** (SOFT) — scans the override body for
+       heuristic patterns that suggest an attempt to weaken the framework's
+       safety / confidentiality / privacy / data-not-instructions baseline.
+       Hits are advisory — prose explanations of *what not to do* can
+       false-positive here, so the check never blocks the run.
+    """
+    # Check 1: canonical header marker.
+    if _OVERRIDE_HEADER_MARKER not in text:
+        yield Violation(
+            path,
+            1,
+            f"override-contract [structure]: override file is missing the "
+            f"'<!-- {_OVERRIDE_HEADER_MARKER}' header comment — "
+            f"run '/magpie-setup override <skill>' to scaffold a conforming file "
+            f"(see docs/setup/agentic-overrides.md)",
+            category=OVERRIDE_CONTRACT_CATEGORY,
+        )
+
+    # Check 2: baseline-weakening patterns.
+    lines = text.splitlines()
+    for line_no, line in enumerate(lines, start=1):
+        # Skip comment lines — prose explaining what NOT to do (or the header
+        # itself) should not trigger the heuristic.
+        stripped = line.strip()
+        if stripped.startswith("<!--") or stripped.startswith("-->"):
+            continue
+        for pattern, message in _OVERRIDE_WEAKENING_PATTERNS:
+            if pattern.search(line):
+                yield Violation(
+                    path,
+                    line_no,
+                    f"{message} (line: {stripped[:120]!r})",
+                    category=OVERRIDE_CONTRACT_CATEGORY,
+                )
+                break  # one violation per line is enough
+
+
+def validate_override_contract(root: Path | None = None) -> Iterable[Violation]:
+    """Scan ``.apache-magpie-overrides/`` for override files and validate each.
+
+    Silently skips when the directory is absent (not every repo has adopted
+    the framework or written overrides). When it exists, every ``.md`` file
+    in the directory is checked against the override-file contract:
+
+    - the canonical header comment is present, and
+    - the text does not attempt to weaken the framework baseline.
+
+    All violations are SOFT advisories.
+    """
+    repo_root = root or find_repo_root()
+    overrides_dir = repo_root / OVERRIDES_DIR
+    if not overrides_dir.is_dir():
+        return
+
+    for override_file in sorted(overrides_dir.glob("*.md")):
+        if override_file.name == "README.md":
+            continue  # scaffold README is informational, not an override
+        try:
+            text = override_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            yield Violation(
+                override_file, None, f"cannot read override file: {exc}", category=OVERRIDE_CONTRACT_CATEGORY
+            )
+            continue
+        yield from validate_override_file(override_file, text)
+
+
+# ---------------------------------------------------------------------------
 # Eval-coverage check (check #9, SOFT)
 # ---------------------------------------------------------------------------
 
@@ -1995,6 +2644,172 @@ def validate_eval_coverage(root: Path | None = None) -> Iterable[Violation]:
                 None,
                 f"eval-coverage: no eval suite at tools/skill-evals/evals/{slug}/ — add one before shipping",
                 category=EVAL_COVERAGE_CATEGORY,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Project-template drift check (check #15, SOFT advisory)
+# ---------------------------------------------------------------------------
+
+# DocToc-generated TOC block — strip before comparing headings so that
+# section titles in the generated table of contents do not double-count as h2s.
+_DOCTOC_BLOCK_RE = re.compile(
+    r"<!-- START doctoc.*?<!-- END doctoc[^\n]*\n",
+    re.DOTALL,
+)
+
+# Markdown link where the link text is a backtick-quoted filename, e.g.:
+#   [`issue-tracker-config.md`](issue-tracker-config.md)
+# Group 1: the file name (inside backticks); Group 2: the link target (href).
+_PROJECT_FILE_LINK_RE = re.compile(r"\[`([^`]+)`\]\(([^)#\s]+)\)")
+
+# Files excluded from the h2 heading comparison.  project.md and README.md
+# have intentionally different structures depending on organization profile
+# (project.md has org-inherited blocks the example omits; README.md is a
+# narrative file not a config template).
+_TEMPLATE_DRIFT_H2_SKIP: frozenset[str] = frozenset({"project.md", "README.md"})
+
+
+def _strip_doctoc(text: str) -> str:
+    """Remove the DocToc-generated TOC block so its headings are not counted."""
+    return _DOCTOC_BLOCK_RE.sub("", text)
+
+
+def _extract_h2_headings(text: str) -> list[str]:
+    """Return the text of every h2 heading, in order, after stripping DocToc."""
+    clean = _strip_doctoc(text)
+    return [m.group(1).strip() for m in re.finditer(r"^## (.+)$", clean, re.MULTILINE)]
+
+
+def validate_project_template_drift(root: Path | None = None) -> Iterable[Violation]:
+    """SOFT advisory: detect structural drift between _template and non-asf-example.
+
+    Three checks (all SOFT — advisory, never fails the run unless --strict):
+
+    1. **README file-list coherence**: every file linked in the '## Files'
+       section of non-asf-example/README.md must exist on disk.
+
+    2. **Undocumented files**: every ``.md`` file in non-asf-example/
+       (other than README.md itself) must be mentioned somewhere in
+       non-asf-example/README.md.
+
+    3. **Shared-file h2 alignment**: for each file present in both
+       ``projects/_template/`` and ``projects/non-asf-example/`` (excluding
+       README.md and project.md, whose structures differ intentionally by
+       organization profile), the h2 section headings are compared.  A
+       heading present in the template but absent in the example suggests
+       the example may be missing a section; the reverse suggests the
+       template doc needs updating.  Both are advisory.
+
+    Silently skipped when either directory does not exist — avoids noise
+    on forks that omit the non-ASF example profile.
+    """
+    repo_root = root or find_repo_root()
+    template_dir = repo_root / PROJECTS_TEMPLATE_DIR
+    example_dir = repo_root / PROJECTS_NON_ASF_EXAMPLE_DIR
+
+    if not template_dir.is_dir() or not example_dir.is_dir():
+        return
+
+    example_readme = example_dir / "README.md"
+    if not example_readme.exists():
+        yield Violation(
+            example_readme,
+            None,
+            "template-drift [readme-missing]: non-asf-example/README.md is missing — "
+            "the example profile must document its files and explain what differs from "
+            "the _template/ profile",
+            category=TEMPLATE_DRIFT_CATEGORY,
+        )
+        return
+
+    try:
+        example_readme_text = example_readme.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    # -------------------------------------------------------------------
+    # Check 1: README file-list coherence (non-asf-example)
+    # -------------------------------------------------------------------
+    # Locate the "## Files" section and inspect every backtick-linked filename.
+    files_section = ""
+    if "## Files" in example_readme_text:
+        after_header = example_readme_text.split("## Files", 1)[1]
+        next_h2 = after_header.find("\n## ")
+        files_section = after_header[:next_h2] if next_h2 > 0 else after_header
+
+    for m in _PROJECT_FILE_LINK_RE.finditer(files_section):
+        href = m.group(2).strip()
+        # Only check local same-directory links (no ../ traversal, no URLs).
+        if href.startswith(("http://", "https://", "#", "..", "/")):
+            continue
+        target = example_dir / href
+        if not target.exists():
+            yield Violation(
+                example_readme,
+                None,
+                f"template-drift [readme-dead-link]: non-asf-example/README.md "
+                f"'## Files' links to '{href}' but the file does not exist — "
+                f"add the file or remove it from the README",
+                category=TEMPLATE_DRIFT_CATEGORY,
+            )
+
+    # -------------------------------------------------------------------
+    # Check 2: Undocumented files in non-asf-example
+    # -------------------------------------------------------------------
+    for child in sorted(example_dir.iterdir()):
+        if not child.is_file() or child.suffix != ".md" or child.name == "README.md":
+            continue
+        if child.name not in example_readme_text:
+            yield Violation(
+                child,
+                None,
+                f"template-drift [undocumented-file]: non-asf-example/{child.name} "
+                f"exists but is not mentioned in non-asf-example/README.md — "
+                f"add it to the '## Files' section or explain its purpose",
+                category=TEMPLATE_DRIFT_CATEGORY,
+            )
+
+    # -------------------------------------------------------------------
+    # Check 3: Shared-file h2 alignment (excluding project.md and README.md)
+    # -------------------------------------------------------------------
+    template_files = {p.name for p in template_dir.iterdir() if p.is_file() and p.suffix == ".md"}
+    example_files = {p.name for p in example_dir.iterdir() if p.is_file() and p.suffix == ".md"}
+    shared = (template_files & example_files) - _TEMPLATE_DRIFT_H2_SKIP
+
+    for filename in sorted(shared):
+        try:
+            tmpl_text = (template_dir / filename).read_text(encoding="utf-8")
+            ex_text = (example_dir / filename).read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        tmpl_h2s = set(_extract_h2_headings(tmpl_text))
+        ex_h2s = set(_extract_h2_headings(ex_text))
+
+        missing_from_example = tmpl_h2s - ex_h2s
+        extra_in_example = ex_h2s - tmpl_h2s
+
+        if missing_from_example:
+            yield Violation(
+                example_dir / filename,
+                None,
+                f"template-drift [h2-missing-from-example]: "
+                f"non-asf-example/{filename} is missing h2 section(s) present in "
+                f"_template/{filename}: {sorted(missing_from_example)!r} — "
+                f"add the section(s) or document the intentional omission in the README",
+                category=TEMPLATE_DRIFT_CATEGORY,
+            )
+
+        if extra_in_example:
+            yield Violation(
+                template_dir / filename,
+                None,
+                f"template-drift [h2-extra-in-example]: "
+                f"non-asf-example/{filename} has h2 section(s) not present in "
+                f"_template/{filename}: {sorted(extra_in_example)!r} — "
+                f"add the section(s) to the template so adopters know about them",
+                category=TEMPLATE_DRIFT_CATEGORY,
             )
 
 
@@ -2042,11 +2857,24 @@ def run_validation(root: Path | None = None) -> list[Violation]:
     # Tool-level checks: every tools/<name>/ has a README that declares its capability.
     violations.extend(validate_tools(repo_root))
 
+    # Adapter authoring smoke: contract:* tool READMEs declare credentials,
+    # operations, and config keys (SOFT advisory).
+    violations.extend(validate_adapter_authoring(repo_root))
+
     # Capability-sync check: the doc tables and the source must agree.
     violations.extend(validate_capability_sync(repo_root))
 
     # Eval-coverage check: every skill must have a matching eval suite.
     violations.extend(validate_eval_coverage(repo_root))
+
+    # docs/modes.md consistency check: skill lists and counts match live frontmatter.
+    violations.extend(validate_modes_doc_consistency(repo_root))
+
+    # Override-file contract check: .apache-magpie-overrides/*.md must not weaken baseline.
+    violations.extend(validate_override_contract(repo_root))
+
+    # Project-template drift check: _template/ and non-asf-example/ stay comparable.
+    violations.extend(validate_project_template_drift(repo_root))
 
     return violations
 
@@ -2113,12 +2941,18 @@ def main(argv: list[str] | None = None) -> int:
 
 _SOFT_RULE_PREFIXES: tuple[str, ...] = (
     "action-inventory",
+    "adapter-authoring",
     "asf-coupling",
     "chain-handoff",
     "criteria-source",
     "distinct-from",
     "lowercase-f-field",
+    "modes-doc:",
+    "multi-capability declared",
+    "override-contract",
+    "override-weakening",
     "parenthetical rationale",
+    "template-drift",
     "trigger phrase",
     "injection-guard TODO",
     "security-pattern-1",

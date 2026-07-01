@@ -37,6 +37,9 @@ trustworthy as it grows.
   (soft check: warns when a skill has no eval suite). CLI: `skill-and-tool-validate`.
 - `tools/skill-evals/` — harness for measuring skill behaviour.
 - `tools/sandbox-lint/` — lints the sandbox/permissions configuration.
+- `tools/symlink-lint/` — lints the framework's self-adoption skill
+  symlinks: rejects cyclic symlinks and misdirected relays (canonical/
+  relay target-correctness).
 - `tools/dashboard-generator/` — read-only HTML dashboards over campaign
   artefacts.
 - `tools/probe-templates/` — reusable probes.
@@ -60,8 +63,8 @@ trustworthy as it grows.
 - **Generated, never cached.** `list-skills` reads the live
   `.claude/skills/*/SKILL.md` frontmatter on every run, so the index never
   goes stale.
-- **Deterministic checks.** `skill-and-tool-validator` and `sandbox-lint` are
-  heuristic/text tools with no model calls — reproducible in CI.
+- **Deterministic checks.** `skill-and-tool-validator`, `sandbox-lint`, and
+  `symlink-lint` are heuristic/text tools with no model calls — reproducible in CI.
 - **Hard vs soft rules.** The validator fails on missing frontmatter or
   broken links; advisories are warnings unless `--strict`.
 - **Schema-backed metadata.** Skill frontmatter, tool README capability
@@ -107,10 +110,10 @@ uv run --project tools/skill-and-tool-validator --group dev skill-and-tool-valid
 
 ## Known gaps
 
-- **Eval coverage is complete.** Every shipped skill has a matching suite
-  in `tools/skill-evals/evals/`; the soft eval-coverage check in
-  `skill-and-tool-validator` warns when a newly added skill has no suite,
-  keeping coverage complete going forward.
+- **Eval coverage is complete.** All 63 shipped skills have a matching
+  suite in `tools/skill-evals/evals/`; the soft eval-coverage check in
+  `skill-and-tool-validator` (check #8) warns when a newly added skill has
+  no suite, keeping coverage complete going forward.
 - **Frontmatter validation is still shallow.** Current validation covers
   required fields, but the next pass should make `mode`, `status`,
   `capability`, `organization`, and `source` combinations explicit and
